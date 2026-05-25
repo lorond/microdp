@@ -1,0 +1,26 @@
+{
+  "name": "wallet-postgres-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "${WALLET_DB_HOST}",
+    "database.port": "${WALLET_DB_PORT}",
+    "database.user": "${WALLET_DB_USER}",
+    "database.password": "${WALLET_DB_PASSWORD}",
+    "database.dbname": "${WALLET_DB_NAME}",
+    "topic.prefix": "wallet",
+    "plugin.name": "pgoutput",
+    "slot.name": "wallet_slot",
+    "publication.name": "wallet_publication",
+    "publication.autocreate.mode": "filtered",
+    "table.include.list": "public.users,public.accounts,public.transactions",
+    "snapshot.mode": "initial",
+    "decimal.handling.mode": "string",
+    "time.precision.mode": "connect",
+    "tombstones.on.delete": "false",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter.schemas.enable": "false"
+  }
+}
+

@@ -1,0 +1,506 @@
+name: ${COMPOSE_PROJECT_NAME:-microdp}
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-airflow-common-env: &airflow-common-env
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+  AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-webserver:8080/execution/
+  AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?AIRFLOW_JWT_SECRET must be set in .env (openssl rand -hex 64)}
+  # Airflow 3.x по умолчанию использует SimpleAuthManager (не FAB). Старые _AIRFLOW_WWW_USER_*
+  # env игнорируются → если passwords_file не задан, генерируется случайный пароль для admin
+  # в <AIRFLOW_HOME>/simple_auth_manager_passwords.json.generated. Задаём детерминированный
+  # файл с креды из .env, общий между всеми airflow-сервисами через volume airflow-auth.
+  AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "${AIRFLOW_ADMIN_USER:-airflow}:admin"
+  AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE: /opt/airflow/auth/simple_auth_manager_passwords.json
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+  KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-redpanda:9092}
+  CLICKSTREAM_TOPIC: ${CLICKSTREAM_TOPIC:-clickstream.events}
+  ICEBERG_CATALOG_URI: http://nessie:19120/iceberg
+  ICEBERG_WAREHOUSE: warehouse
+  S3_ENDPOINT: http://s3:3900
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:-admin}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:-password}
+  DEBEZIUM_CONNECT_URL: http://connect:8083
+  PYTHONPATH: /opt/airflow
+  # SparkSubmitHook ≥5.4 строит master из conn.host (а не из query-параметра master=).
+  # Host = local[*] (URL-encoded: local%5B%2A%5D); query параметры передают deploy-mode и spark-binary.
+  AIRFLOW_CONN_SPARK_DEFAULT: "spark://local%5B%2A%5D?deploy-mode=client&spark-binary=spark-submit"
+  WALLET_DB_HOST: postgres
+  WALLET_DB_PORT: "5432"
+  WALLET_DB_NAME: ${POSTGRES_DB:-wallet}
+  WALLET_DB_USER: ${POSTGRES_USER:-wallet}
+  WALLET_DB_PASSWORD: ${POSTGRES_PASSWORD:-wallet}
+
+x-airflow-common: &airflow-common
+  image: ${AIRFLOW_IMAGE:-microdp-airflow:0.1.0}
+  build:
+    context: ..
+    dockerfile: infra/airflow/Dockerfile
+  user: "${AIRFLOW_UID:-50000}:0"
+  environment:
+    <<: *airflow-common-env
+  volumes:
+    - ../etl/airflow/dags:/opt/airflow/dags
+    - ../etl/spark:/opt/airflow/spark
+    - ../infra/connectors:/opt/airflow/connectors
+    - airflow-logs:/opt/airflow/logs
+    - airflow-auth:/opt/airflow/auth
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redpanda:
+      condition: service_healthy
+    s3:
+      condition: service_healthy
+    nessie:
+      condition: service_healthy
+    connect:
+      condition: service_healthy
+
+services:
+  postgres:
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 1g
+    image: ${POSTGRES_IMAGE:-postgres:18.3}
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-wallet}
+      POSTGRES_USER: ${POSTGRES_USER:-wallet}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-wallet}
+      PGDATA: /var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-wallet} -d ${POSTGRES_DB:-wallet}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redpanda:
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 2g
+    image: ${REDPANDA_IMAGE:-docker.redpanda.com/redpandadata/redpanda:v26.1.5}
+    command:
+      - redpanda
+      - start
+      - --smp
+      - "1"
+      - --memory
+      - 1G
+      - --reserve-memory
+      - 0M
+      - --overprovisioned
+      - --node-id
+      - "0"
+      - --check=false
+      - --kafka-addr
+      - PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:19092
+      - --advertise-kafka-addr
+      - PLAINTEXT://redpanda:9092,OUTSIDE://localhost:19092
+    ports:
+      - "19092:19092"
+      - "9644:9644"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  redpanda-console:
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 512m
+    image: ${REDPANDA_CONSOLE_IMAGE:-docker.redpanda.com/redpandadata/console:v3.2.0}
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      CONNECT_ENABLED: "true"
+      CONNECT_CLUSTERS_NAME: microdp-connect
+      CONNECT_CLUSTERS_URL: http://connect:8083
+    ports:
+      - "8089:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/admin/health | grep -q '\"isHttpOk\":true' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  connect:
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 1500m
+    image: ${DEBEZIUM_CONNECT_IMAGE:-quay.io/debezium/connect:3.5.1.Final}
+    environment:
+      BOOTSTRAP_SERVERS: redpanda:9092
+      GROUP_ID: microdp-connect
+      CONFIG_STORAGE_TOPIC: microdp_connect_configs
+      OFFSET_STORAGE_TOPIC: microdp_connect_offsets
+      STATUS_STORAGE_TOPIC: microdp_connect_statuses
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_REST_ADVERTISED_HOST_NAME: connect
+      KAFKA_HEAP_OPTS: "-Xms256m -Xmx768m"
+    ports:
+      - "8083:8083"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/connector-plugins >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  s3:
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 512m
+    image: ${GARAGE_IMAGE:-dxflrs/garage:v2.3.0}
+    # --single-node + --default-bucket + --default-access-key: на первом старте
+    # Garage сам создаёт layout (zone dc1, capacity 1G), импортирует ключ из
+    # GARAGE_DEFAULT_ACCESS_KEY/SECRET_KEY и заводит бакет GARAGE_DEFAULT_BUCKET
+    # с rw-доступом для этого ключа. Bootstrap-контейнер с garage CLI не нужен.
+    command: ["/garage", "server", "--single-node", "--default-bucket", "--default-access-key"]
+    environment:
+      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET:?GARAGE_RPC_SECRET must be set in .env (openssl rand -hex 32)}
+      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:?GARAGE_ADMIN_TOKEN must be set in .env (openssl rand -hex 32)}
+      GARAGE_DEFAULT_BUCKET: warehouse
+      GARAGE_DEFAULT_ACCESS_KEY: ${S3_ACCESS_KEY:-admin}
+      GARAGE_DEFAULT_SECRET_KEY: ${S3_SECRET_KEY:-password}
+    volumes:
+      - ./garage/garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+    ports:
+      - "3900:3900"
+    # Image на scratch → нет sh/curl/nc; healthcheck идёт через сам garage-бинарь.
+    healthcheck:
+      test: ["CMD", "/garage", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  s3-ui:
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 256m
+    image: ${GARAGE_WEBUI_IMAGE:-khairul169/garage-webui:1.1.0}
+    depends_on:
+      s3:
+        condition: service_healthy
+    # WebUI ищет /etc/garage.toml для извлечения rpc_public_addr/admin_token; без файла
+    # отдаёт мусор без HTTP-заголовков. Mount-им тот же конфиг, env-vars дублируют
+    # значения для надёжности (admin_token берётся из GARAGE_ADMIN_TOKEN).
+    volumes:
+      - ./garage/garage.toml:/etc/garage.toml:ro
+    environment:
+      API_BASE_URL: http://s3:3903
+      API_ADMIN_KEY: ${GARAGE_ADMIN_TOKEN}
+      S3_ENDPOINT_URL: http://s3:3900
+      S3_REGION: us-east-1
+    ports:
+      - "3909:3909"
+
+  nessie:
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 1g
+    image: ${NESSIE_IMAGE:-ghcr.io/projectnessie/nessie:0.107.5}
+    environment:
+      NESSIE_VERSION_STORE_TYPE: JDBC2
+      NESSIE_VERSION_STORE_PERSIST_JDBC_DATASOURCE: postgresql
+      QUARKUS_DATASOURCE_POSTGRESQL_ACTIVE: "true"
+      QUARKUS_DATASOURCE_POSTGRESQL_JDBC_URL: jdbc:postgresql://postgres:5432/nessie
+      QUARKUS_DATASOURCE_POSTGRESQL_USERNAME: nessie
+      QUARKUS_DATASOURCE_POSTGRESQL_PASSWORD: nessie
+      NESSIE_CATALOG_DEFAULT_WAREHOUSE: warehouse
+      NESSIE_CATALOG_WAREHOUSES_WAREHOUSE_LOCATION: s3://warehouse/
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ENDPOINT: http://s3:3900
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_PATH_STYLE_ACCESS: "true"
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_REGION: us-east-1
+      # Garage не поддерживает chunked encoding (STREAMING-AWS4-HMAC-SHA256-PAYLOAD)
+      # и возвращает 400 "Invalid payload signature" на любой PUT через AWS SDK v2.
+      # Nessie пишет metadata.json напрямую через свой S3 клиент при CREATE TABLE,
+      # поэтому отключаем chunked encoding здесь же. См.
+      # https://git.deuxfleurs.fr/Deuxfleurs/garage/issues/1110
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_CHUNKED_ENCODING_ENABLED: "false"
+      # Nessie 0.103+ требует secret-reference: `access-key` указывает на ИМЯ секрета,
+      # а сам секрет регистрируется через `nessie.catalog.secrets.<name>.{name,secret}`.
+      # auth-type=STATIC означает «брать креды напрямую из конфига Quarkus».
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_AUTH_TYPE: STATIC
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ACCESS_KEY: urn:nessie-secret:quarkus:nessie.catalog.secrets.s3creds
+      NESSIE_CATALOG_SECRETS_S3CREDS_NAME: ${S3_ACCESS_KEY:-admin}
+      NESSIE_CATALOG_SECRETS_S3CREDS_SECRET: ${S3_SECRET_KEY:-password}
+    ports:
+      - "19120:19120"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      s3:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/19120' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  airflow-init:
+    <<: *airflow-common
+    # Под root: named volume airflow-auth первым делом создан как root:root, airflow uid 50000
+    # не может писать. После записи passwords-файла chown'им под airflow uid; /entrypoint
+    # Airflow корректно drop-ает привилегии при запуске subcommand-а.
+    user: "0:0"
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER:-airflow}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-airflow}
+      AIRFLOW_UID: ${AIRFLOW_UID:-50000}
+    # Перед запуском Airflow entrypoint детерминированно перезаписываем passwords-файл
+    # SimpleAuthManager на креды из .env. Без этого Airflow 3.x генерирует случайный
+    # пароль и README-обещание airflow/airflow перестаёт работать. python -c json.dump
+    # корректно экранирует любые спецсимволы в пароле.
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        mkdir -p /opt/airflow/auth
+        python -c "import json,os; json.dump({os.environ['AIRFLOW_ADMIN_USER']: os.environ['AIRFLOW_ADMIN_PASSWORD']}, open('/opt/airflow/auth/simple_auth_manager_passwords.json','w'))"
+        chown -R "$${AIRFLOW_UID}:0" /opt/airflow/auth
+        chmod 0640 /opt/airflow/auth/simple_auth_manager_passwords.json
+        exec /entrypoint version
+
+  airflow-webserver:
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 1g
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/api/v2/monitor/health | grep -q '\"metadatabase\":{\"status\":\"healthy\"}' || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+
+  airflow-scheduler:
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 2g
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 1g
+    <<: *airflow-common
+    command: dag-processor
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  wallet-api:
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 256m
+    build:
+      context: ../apps/wallet-api
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-wallet}:${POSTGRES_PASSWORD:-wallet}@postgres:5432/${POSTGRES_DB:-wallet}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  clickstream-api:
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 256m
+    build:
+      context: ../apps/clickstream-api
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-redpanda:9092}
+      CLICKSTREAM_TOPIC: ${CLICKSTREAM_TOPIC:-clickstream.events}
+      CLICKSTREAM_DLQ_TOPIC: ${CLICKSTREAM_DLQ_TOPIC:-clickstream.events.dlq}
+    ports:
+      - "8001:8001"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  transaction-emulator:
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 128m
+    build:
+      context: ../apps/transaction-emulator
+    environment:
+      WALLET_API_URL: http://wallet-api:8000
+      CLICKSTREAM_API_URL: http://clickstream-api:8001
+      DEMO_USER_IDS: ${DEMO_USER_IDS:-00000000-0000-0000-0000-000000000002,00000000-0000-0000-0000-000000000003}
+      TRANSACTIONS_PER_MINUTE: ${TRANSACTIONS_PER_MINUTE:-6}
+      EMULATOR_ENABLED: ${EMULATOR_ENABLED:-true}
+    depends_on:
+      wallet-api:
+        condition: service_healthy
+      clickstream-api:
+        condition: service_healthy
+
+  wallet-ui:
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 128m
+    build:
+      context: ../apps/wallet-ui
+    ports:
+      - "3000:80"
+    depends_on:
+      wallet-api:
+        condition: service_healthy
+      clickstream-api:
+        condition: service_healthy
+
+  starrocks-fe:
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 4g
+    image: ${STARROCKS_FE_IMAGE:-starrocks/fe-ubuntu:4.0.10}
+    hostname: starrocks-fe
+    command: ["/opt/starrocks/fe/bin/start_fe.sh"]
+    ports:
+      - "8030:8030"
+      - "9020:9020"
+      - "9030:9030"
+    volumes:
+      - starrocks-fe-meta:/opt/starrocks/fe/meta
+    healthcheck:
+      test: ["CMD-SHELL", "mysql -h 127.0.0.1 -P 9030 -u root -e 'SELECT 1' >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+
+  starrocks-be:
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 6g
+    image: ${STARROCKS_BE_IMAGE:-starrocks/be-ubuntu:4.0.10}
+    hostname: starrocks-be
+    command: ["/opt/starrocks/be/bin/start_be.sh"]
+    ports:
+      - "8040:8040"
+      - "9050:9050"
+      - "9060:9060"
+    volumes:
+      - starrocks-be-storage:/opt/starrocks/be/storage
+    depends_on:
+      starrocks-fe:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9060' >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+
+  starrocks-init:
+    image: ${MYSQL_CLIENT_IMAGE:-mysql:9.7.0}
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-admin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-password}
+    volumes:
+      - ../sql/starrocks:/sql:ro
+      - ./starrocks/init.sh:/init.sh:ro
+    depends_on:
+      starrocks-fe:
+        condition: service_healthy
+      starrocks-be:
+        condition: service_healthy
+      nessie:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/init.sh"]
+
+  superset:
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 1g
+    image: ${SUPERSET_IMAGE:-microdp-superset:0.1.0}
+    build:
+      context: ..
+      dockerfile: infra/superset/Dockerfile
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-change-me-for-local-demo-only}
+      SUPERSET_ADMIN_USER: ${SUPERSET_ADMIN_USER:-admin}
+      SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD:-admin}
+      SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
+    ports:
+      - "8088:8088"
+    volumes:
+      - superset-home:/app/superset_home
+      - ./superset:/app/bootstrap:ro
+    depends_on:
+      starrocks-init:
+        condition: service_completed_successfully
+    entrypoint: ["/bin/sh", "/app/bootstrap/bootstrap.sh"]
+
+volumes:
+  postgres-data:
+  redpanda-data:
+  garage-meta:
+  garage-data:
+  airflow-logs:
+  airflow-auth:
+  starrocks-fe-meta:
+  starrocks-be-storage:
+  superset-home:
