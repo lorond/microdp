@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.repository import direction_for_type, get_repository
-from app.schemas import BalanceResponse, TransactionCreate, TransactionResponse
+from app.schemas import BalanceResponse, TransactionCreate, TransactionResponse, UserResponse
 
 
 USER_ID = UUID("00000000-0000-0000-0000-000000000001")
@@ -16,6 +16,16 @@ ACCOUNT_ID = UUID("10000000-0000-0000-0000-000000000001")
 class FakeRepository:
     def __init__(self):
         self.balance = Decimal("100.00")
+
+    def list_users(self):
+        return [
+            UserResponse(
+                id=USER_ID,
+                full_name="Demo",
+                email="demo@example.com",
+                created_at=datetime.now(UTC),
+            )
+        ]
 
     def get_balance(self, user_id):
         return BalanceResponse(
@@ -112,6 +122,20 @@ class InsufficientFundsRepository:
     def create_transaction(self, user_id, payload):
         from app.repository import InsufficientFunds
         raise InsufficientFunds("Insufficient funds for debit transaction")
+
+
+def test_list_users_returns_seeded_users():
+    fake_repo = FakeRepository()
+    app.dependency_overrides[get_repository] = lambda: fake_repo
+    client = TestClient(app)
+
+    response = client.get("/api/users")
+    assert response.status_code == 200
+    payload = response.json()
+    assert "users" in payload and len(payload["users"]) >= 1
+    assert payload["users"][0]["full_name"] == "Demo"
+
+    app.dependency_overrides.clear()
 
 
 def test_create_transaction_insufficient_funds_returns_409():

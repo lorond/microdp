@@ -48,3 +48,14 @@ class TransactionListResponse(BaseModel):
     user_id: UUID
     transactions: list[TransactionResponse]
 
+
+class UserResponse(BaseModel):
+    id: UUID
+    full_name: str
+    email: str
+    created_at: datetime
+
+
+class UserListResponse(BaseModel):
+    users: list[UserResponse]
+

@@ -5,7 +5,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
-from .schemas import BalanceResponse, TransactionCreate, TransactionResponse
+from .schemas import BalanceResponse, TransactionCreate, TransactionResponse, UserResponse
 from .settings import settings
 
 
@@ -31,6 +31,17 @@ class WalletRepository:
 
     def _connect(self):
         return self.pool.connection()
+
+    def list_users(self) -> list[UserResponse]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, full_name, email, created_at
+                FROM users
+                ORDER BY created_at
+                """,
+            ).fetchall()
+        return [UserResponse(**row) for row in rows]
 
     def get_balance(self, user_id: UUID) -> BalanceResponse:
         with self._connect() as conn:

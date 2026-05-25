@@ -32,4 +32,10 @@ superset set-database-uri \
   --database_name "${STARROCKS_DB_NAME}" \
   --uri "${STARROCKS_URI}"
 
-exec gunicorn --bind 0.0.0.0:8088 --workers 2 --timeout 120 'superset.app:create_app()'
+# gunicorn --timeout должен быть строго больше SUPERSET_SQLLAB_TIMEOUT, иначе
+# worker умрёт раньше, чем Superset успеет вернуть ответ или отрисовать ошибку.
+exec gunicorn \
+  --bind 0.0.0.0:8088 \
+  --workers 2 \
+  --timeout "${SUPERSET_GUNICORN_TIMEOUT:-180}" \
+  'superset.app:create_app()'

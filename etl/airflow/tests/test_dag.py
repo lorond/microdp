@@ -29,6 +29,7 @@ def test_dag_task_ids(dag):
         "ingest_clickstream_to_bronze",
         "build_silver_and_gold_marts",
         "smoke_check_layers",
+        "refresh_starrocks_marts",
     }
     assert {task.task_id for task in dag.tasks} == expected
 
@@ -44,7 +45,9 @@ def test_dag_dependency_chain(dag):
     )
     assert "build_silver_and_gold_marts" in downstream("ingest_postgres_cdc_to_bronze")
     assert "build_silver_and_gold_marts" in downstream("ingest_clickstream_to_bronze")
-    assert "smoke_check_layers" in downstream("build_silver_and_gold_marts")
+    assert {"smoke_check_layers", "refresh_starrocks_marts"} <= downstream(
+        "build_silver_and_gold_marts"
+    )
 
 
 def test_dag_schedule_and_settings(dag):

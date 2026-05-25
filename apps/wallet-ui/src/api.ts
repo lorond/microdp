@@ -1,11 +1,19 @@
-import type { Balance, Transaction, TransactionType } from "./types";
+import type { Balance, Transaction, TransactionType, User } from "./types";
 
+// Единственный жёстко прописанный ID — пользователь Demo. Используется как
+// default-selection в UI до того, как fetchUsers() вернёт реальный список из БД.
+// Все остальные пользователи генерируются init-скриптом Postgres со случайными
+// UUID и подтягиваются динамически — см. apps/wallet-api/app/main.py:list_users.
 export const DEMO_USER_ID = "00000000-0000-0000-0000-000000000001";
-export const DEMO_USERS = [
-  { id: "00000000-0000-0000-0000-000000000001", label: "Demo Customer" },
-  { id: "00000000-0000-0000-0000-000000000002", label: "Travel Customer" },
-  { id: "00000000-0000-0000-0000-000000000003", label: "Retail Customer" }
-] as const;
+
+export async function fetchUsers(): Promise<User[]> {
+  const response = await fetch("/api/users");
+  if (!response.ok) {
+    throw new Error(`Users request failed: ${response.status}`);
+  }
+  const payload = await response.json();
+  return payload.users;
+}
 
 export async function fetchBalance(userId = DEMO_USER_ID): Promise<Balance> {
   const response = await fetch(`/api/users/${userId}/balance`);

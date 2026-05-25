@@ -48,17 +48,22 @@ CREATE INDEX IF NOT EXISTS idx_accounts_user_id ON accounts(user_id);
 CREATE INDEX IF NOT EXISTS idx_transactions_user_created ON transactions(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_transactions_account_created ON transactions(account_id, created_at DESC);
 
+-- Единственный жёстко прописанный пользователь — Demo (`...001`). Его UUID и
+-- баланс не должны «съезжать» между прогонами, чтобы UI и smoke-скрипт всегда
+-- могли на него ссылаться. Остальные демо-пользователи генерируются скриптом
+-- `002_seed_demo_users.sh` с рандомными UUID и именами из заранее заданного
+-- пула — см. infra/postgres/init/002_seed_demo_users.sh.
 INSERT INTO users (id, full_name, email)
-VALUES
-    ('00000000-0000-0000-0000-000000000001', 'Demo Customer', 'demo@example.com'),
-    ('00000000-0000-0000-0000-000000000002', 'Travel Customer', 'travel@example.com'),
-    ('00000000-0000-0000-0000-000000000003', 'Retail Customer', 'retail@example.com')
+VALUES ('00000000-0000-0000-0000-000000000001', 'Demo', 'demo@example.com')
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO accounts (id, user_id, currency, opening_balance, current_balance)
-VALUES
-    ('10000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 'USD', 1250.00, 1250.00),
-    ('10000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000002', 'USD', 850.00, 850.00),
-    ('10000000-0000-0000-0000-000000000003', '00000000-0000-0000-0000-000000000003', 'USD', 1500.00, 1500.00)
+VALUES (
+    '10000000-0000-0000-0000-000000000001',
+    '00000000-0000-0000-0000-000000000001',
+    'USD',
+    1250.00,
+    1250.00
+)
 ON CONFLICT (id) DO NOTHING;
 

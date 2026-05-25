@@ -8,6 +8,7 @@ from string import Template
 from typing import Mapping
 
 import pendulum
+import pymysql
 import requests
 from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
 from airflow.sdk import dag, task
@@ -41,6 +42,26 @@ CONNECTOR_TEMPLATE_VARS = (
 SPARK_CONN_ID = os.getenv("SPARK_CONN_ID", "spark_default")
 SPARK_DIR = "/opt/airflow/spark"
 SPARK_COMMON_PY = f"{SPARK_DIR}/common.py"
+
+STARROCKS_FE_HOST = os.getenv("STARROCKS_FE_HOST", "starrocks-fe")
+STARROCKS_FE_QUERY_PORT = int(os.getenv("STARROCKS_FE_QUERY_PORT", "9030"))
+STARROCKS_USER = os.getenv("STARROCKS_USER", "admin")
+STARROCKS_PASSWORD = os.getenv("STARROCKS_PASSWORD", "admin")
+STARROCKS_LAKE_CATALOG = os.getenv("STARROCKS_LAKE_CATALOG", "demo_lake")
+STARROCKS_GOLD_DB = "gold"
+# В StarRocks внешний Iceberg-каталог показывает namespace'ы (`gold`) как DB,
+# а Spark-овский каталог `lakehouse` к ним не относится: REFRESH EXTERNAL TABLE
+# принимает только 2 или 3 части (`db.table` либо `catalog.db.table`).
+STARROCKS_GOLD_TABLES = (
+    "current_balances",
+    "transaction_volume_daily",
+    "page_engagement_daily",
+    "button_clicks_daily",
+    "conversion_funnel_daily",
+    "conversion_funnel_cta_daily",
+    "user_engagement_daily",
+    "sessions",
+)
 
 # Maven coordinates Iceberg/Kafka jars нужно передавать через spark-submit --packages,
 # а не только через SparkSession.builder.config(spark.jars.packages, ...): на момент
@@ -149,17 +170,92 @@ def microdp_data_platform_e2e():
         update.raise_for_status()
         return "updated"
 
+    @task(retries=2, retry_delay=pendulum.duration(seconds=10))
+    def refresh_starrocks_marts() -> dict:
+        # Прогрев в три шага, чтобы первый SELECT в Superset SQL Lab уложился в его
+        # 30-сек query_timeout даже после холодного `docker compose up`:
+        #   1. REFRESH EXTERNAL TABLE — инвалидирует IcebergMetadataCache на FE,
+        #      форсирует подтянуть свежие manifest'ы из Nessie + Garage.
+        #   2. ANALYZE TABLE — собирает column-stats Iceberg-таблицы, чтобы
+        #      планировщик StarRocks не делал это синхронно на первом запросе
+        #      пользователя (это отдельный read-path к Parquet footer'ам).
+        #   3. SELECT * ... LIMIT — прогревает BE: инициализирует S3-клиент к
+        #      Garage, открывает Parquet-файлы (footer + хотя бы один row group)
+        #      и наполняет BE DataCache. count(*) для этого НЕ годится: на Iceberg
+        #      StarRocks отвечает на него из manifest'ов (record_count pushdown)
+        #      и BE даже не дёргает S3 — поэтому первый `SELECT *` всё равно
+        #      остаётся холодным и валится по 30s.
+        conn = pymysql.connect(
+            host=STARROCKS_FE_HOST,
+            port=STARROCKS_FE_QUERY_PORT,
+            user=STARROCKS_USER,
+            password=STARROCKS_PASSWORD,
+            connect_timeout=10,
+            read_timeout=300,
+            write_timeout=10,
+            autocommit=True,
+        )
+        refreshed: list[str] = []
+        analyzed: list[str] = []
+        warmed: list[str] = []
+        failed: dict[str, str] = {}
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SET CATALOG `{STARROCKS_LAKE_CATALOG}`")
+                for table in STARROCKS_GOLD_TABLES:
+                    fqn = (
+                        f"`{STARROCKS_LAKE_CATALOG}`.`{STARROCKS_GOLD_DB}`.`{table}`"
+                    )
+                    try:
+                        cur.execute(f"REFRESH EXTERNAL TABLE {fqn}")
+                        refreshed.append(table)
+                    except Exception as exc:  # noqa: BLE001
+                        failed[f"refresh:{table}"] = str(exc)
+                        continue
+
+                    try:
+                        cur.execute(f"ANALYZE TABLE {fqn}")
+                        cur.fetchall()
+                        analyzed.append(table)
+                    except Exception as exc:  # noqa: BLE001
+                        # Stats — best effort: при ошибке прогрев данных всё равно
+                        # сделаем, просто планировщик может оказаться чуть медленнее.
+                        failed[f"analyze:{table}"] = str(exc)
+
+                    # try:
+                    #     cur.execute(f"SELECT * FROM {fqn} LIMIT 1000")
+                    #     cur.fetchall()
+                    #     warmed.append(table)
+                    # except Exception as exc:  # noqa: BLE001
+                    #     failed[f"warm:{table}"] = str(exc)
+        finally:
+            conn.close()
+        logger.info(
+            "refreshed=%s analyzed=%s warmed=%s failed=%s",
+            refreshed,
+            analyzed,
+            warmed,
+            failed,
+        )
+        # Падаем только если не смогли REFRESH или прогрев данных — это и есть
+        # то, ради чего таска существует. ANALYZE-ошибки уходят в лог, но не валят.
+        critical = {k: v for k, v in failed.items() if not k.startswith("analyze:")}
+        if critical:
+            raise RuntimeError(f"StarRocks mart refresh had errors: {critical}")
+        return {"refreshed": refreshed, "analyzed": analyzed, "warmed": warmed}
+
     init_lakehouse = spark_task("init_lakehouse_tables", "init_tables.py")
     ingest_pg_cdc = spark_task("ingest_postgres_cdc_to_bronze", "ingest_pg_cdc.py")
     ingest_clickstream = spark_task("ingest_clickstream_to_bronze", "ingest_clickstream.py")
     build_marts = spark_task("build_silver_and_gold_marts", "build_marts.py")
     smoke_checks = spark_task("smoke_check_layers", "smoke_checks.py")
+    refresh_marts = refresh_starrocks_marts()
 
     connect_ready = wait_for_connect()
     connector = register_debezium_connector()
     connect_ready >> connector >> init_lakehouse >> [ingest_pg_cdc, ingest_clickstream]
     [ingest_pg_cdc, ingest_clickstream] >> build_marts
-    build_marts >> smoke_checks
+    build_marts >> [smoke_checks, refresh_marts]
 
 
 microdp_data_platform_e2e()

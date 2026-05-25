@@ -22,3 +22,12 @@ FEATURE_FLAGS = {
     "ENABLE_TEMPLATE_PROCESSING": True,
 }
 
+# Cинхронный лимит SQL Lab. Дефолт Superset — 30s, и этот же таймаут Superset
+# прокидывает в StarRocks как session `query_timeout`. На холодную Iceberg-планы
+# через Nessie + Garage не успевают, поэтому поднимаем. Должен быть < gunicorn
+# --timeout (см. bootstrap.sh), иначе worker убьёт запрос раньше Superset'а.
+SQLLAB_TIMEOUT = int(os.environ.get("SUPERSET_SQLLAB_TIMEOUT", "120"))
+SUPERSET_WEBSERVER_TIMEOUT = int(
+    os.environ.get("SUPERSET_WEBSERVER_TIMEOUT", "180")
+)
+

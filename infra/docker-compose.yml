@@ -36,6 +36,11 @@ x-airflow-common-env: &airflow-common-env
   WALLET_DB_NAME: ${POSTGRES_DB:-wallet}
   WALLET_DB_USER: ${POSTGRES_USER:-wallet}
   WALLET_DB_PASSWORD: ${POSTGRES_PASSWORD:-wallet}
+  STARROCKS_FE_HOST: starrocks-fe
+  STARROCKS_FE_QUERY_PORT: "9030"
+  STARROCKS_USER: admin
+  STARROCKS_PASSWORD: admin
+  STARROCKS_LAKE_CATALOG: demo_lake
 
 x-airflow-common: &airflow-common
   image: ${AIRFLOW_IMAGE:-microdp-airflow:0.1.0}
@@ -81,6 +86,10 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-wallet}
       POSTGRES_USER: ${POSTGRES_USER:-wallet}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-wallet}
+      # Сколько демо-пользователей наплодит 002_seed_demo_users.sh при первом
+      # init'е тома. Demo (...001) добавляется отдельно в 001_init.sql и сюда не
+      # входит. init scripts отрабатывают ТОЛЬКО на чистом томе postgres-data.
+      DEMO_USERS_GENERATE_COUNT: ${DEMO_USERS_GENERATE_COUNT:-10}
       PGDATA: /var/lib/postgresql/data
     ports:
       - "5432:5432"
@@ -388,8 +397,11 @@ services:
     environment:
       WALLET_API_URL: http://wallet-api:8000
       CLICKSTREAM_API_URL: http://clickstream-api:8001
-      DEMO_USER_IDS: ${DEMO_USER_IDS:-00000000-0000-0000-0000-000000000002,00000000-0000-0000-0000-000000000003}
-      TRANSACTIONS_PER_MINUTE: ${TRANSACTIONS_PER_MINUTE:-6}
+      # Эмулятор сам стучится в wallet-api /api/users и берёт всех, кроме
+      # DEMO_USER_ID (зарезервирован под ручную демонстрацию в UI).
+      DEMO_USER_ID: ${DEMO_USER_ID:-00000000-0000-0000-0000-000000000001}
+      TRANSACTIONS_PER_MINUTE: ${TRANSACTIONS_PER_MINUTE:-30}
+      MAX_CONCURRENT_ACTIVITIES: ${MAX_CONCURRENT_ACTIVITIES:-4}
       EMULATOR_ENABLED: ${EMULATOR_ENABLED:-true}
     depends_on:
       wallet-api:
@@ -437,7 +449,24 @@ services:
     mem_limit: 6g
     image: ${STARROCKS_BE_IMAGE:-starrocks/be-ubuntu:4.0.10}
     hostname: starrocks-be
-    command: ["/opt/starrocks/be/bin/start_be.sh"]
+    # Включаем DataCache, чтобы Parquet footer'ы и блоки Iceberg-таблиц
+    # (read-path к Garage S3) кешировались на BE — иначе первый SELECT на
+    # холодную упирается в сетевые round-trip'ы к s3:3900 и валится по
+    # 30-сек таймауту Superset SQL Lab. be.conf в image пересоздаётся при
+    # каждом старте контейнера, так что append не накапливается.
+    command:
+      - /bin/bash
+      - -c
+      - |
+        cat >> /opt/starrocks/be/conf/be.conf <<'CONF'
+
+        # --- microdp: Iceberg read-path cache ---
+        datacache_enable = true
+        datacache_mem_size = 1G
+        datacache_disk_size = 5G
+        datacache_disk_path = /opt/starrocks/be/storage/datacache
+        CONF
+        exec /opt/starrocks/be/bin/start_be.sh
     ports:
       - "8040:8040"
       - "9050:9050"

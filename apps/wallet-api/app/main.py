@@ -10,7 +10,13 @@ from .repository import (
     build_connection_pool,
     get_repository,
 )
-from .schemas import BalanceResponse, TransactionCreate, TransactionListResponse, TransactionResponse
+from .schemas import (
+    BalanceResponse,
+    TransactionCreate,
+    TransactionListResponse,
+    TransactionResponse,
+    UserListResponse,
+)
 
 
 @asynccontextmanager
@@ -40,6 +46,16 @@ app.add_middleware(
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/users", response_model=UserListResponse)
+def list_users(
+    repository: WalletRepository = Depends(get_repository),
+) -> UserListResponse:
+    # Источник правды для UI и эмулятора. Никакие список или имена нигде в коде
+    # не дублируются — Demo (`...001`) пишется в 001_init.sql, остальные
+    # генерируются 002_seed_demo_users.sh с рандомными UUID и именами.
+    return UserListResponse(users=repository.list_users())
 
 
 @app.get("/api/users/{user_id}/balance", response_model=BalanceResponse)

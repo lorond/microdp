@@ -11,9 +11,9 @@ import {
   UserRound,
   Wallet
 } from "lucide-react";
-import { createTransaction, DEMO_USER_ID, DEMO_USERS, fetchBalance, fetchTransactions } from "./api";
+import { createTransaction, DEMO_USER_ID, fetchBalance, fetchTransactions, fetchUsers } from "./api";
 import { ClickstreamTracker, type ClickstreamSnapshot } from "./clickstream";
-import type { Balance, Transaction, TransactionType } from "./types";
+import type { Balance, Transaction, TransactionType, User } from "./types";
 
 type Page = "dashboard" | "payments" | "history" | "signals";
 
@@ -71,6 +71,7 @@ export function App() {
   const trackerRef = useRef<ClickstreamTracker | null>(null);
   const userIdRef = useRef(DEMO_USER_ID);
   const [userId, setUserId] = useState(DEMO_USER_ID);
+  const [users, setUsers] = useState<User[]>([]);
   const [page, setPage] = useState<Page>("dashboard");
   const [balance, setBalance] = useState<Balance | null>(null);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
@@ -82,7 +83,11 @@ export function App() {
   const [signals, setSignals] = useState<ClickstreamSnapshot>(emptySignals);
 
   const route = `/${page}`;
-  const selectedUser = DEMO_USERS.find((user) => user.id === userId) ?? DEMO_USERS[0];
+  // Подписи берём из БД через /api/users; пока список не приехал, fallback на
+  // "Demo" для дефолтного user_id, чтобы UI не моргал пустым лейблом.
+  const selectedUser =
+    users.find((user) => user.id === userId) ??
+    (userId === DEMO_USER_ID ? { id: DEMO_USER_ID, full_name: "Demo" } : null);
 
   useEffect(() => {
     const tracker = new ClickstreamTracker(() => userIdRef.current);
@@ -102,6 +107,14 @@ export function App() {
   useEffect(() => {
     void refreshData();
   }, [userId]);
+
+  useEffect(() => {
+    fetchUsers()
+      .then(setUsers)
+      .catch((error) =>
+        setStatus(error instanceof Error ? error.message : "Failed to load users")
+      );
+  }, []);
 
   useEffect(() => {
     const syncSignals = () => {
@@ -181,7 +194,7 @@ export function App() {
           </div>
           <div>
             <strong>MicroDP Wallet</strong>
-            <span>{selectedUser.label}</span>
+            <span>{selectedUser?.full_name ?? "…"}</span>
           </div>
         </div>
 
@@ -218,10 +231,14 @@ export function App() {
                 onChange={(event) => setUserId(event.target.value)}
                 data-track-id="switch-demo-user"
                 aria-label="Demo user"
+                disabled={users.length === 0}
               >
-                {DEMO_USERS.map((user) => (
+                {users.length === 0 && (
+                  <option value={DEMO_USER_ID}>{selectedUser?.full_name ?? "Loading…"}</option>
+                )}
+                {users.map((user) => (
                   <option key={user.id} value={user.id}>
-                    {user.label}
+                    {user.full_name}
                   </option>
                 ))}
               </select>

@@ -2,10 +2,11 @@
 set -euo pipefail
 set -o pipefail
 
-# Дефолт указывает на эмуляторного пользователя ...002, а не на ...001 — последний
-# зарезервирован под ручное демо в UI и не должен «съезжать» от smoke-прогонов.
+# Smoke-скрипт ходит на единственный жёстко-заданный демо-ID (Demo user из
+# 001_init.sql), остальные пользователи имеют рандомные UUID и подтягиваются
+# через GET /api/users — smoke на них не завязан намеренно.
 # Для прогона по конкретному user'у переопределить: DEMO_USER_ID=... sh scripts/smoke.sh
-DEMO_USER_ID="${DEMO_USER_ID:-00000000-0000-0000-0000-000000000002}"
+DEMO_USER_ID="${DEMO_USER_ID:-00000000-0000-0000-0000-000000000001}"
 NOW_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 COMPOSE="docker compose -f infra/docker-compose.yml"
 
