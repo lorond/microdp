@@ -179,12 +179,6 @@ def microdp_data_platform_e2e():
         #   2. ANALYZE TABLE — собирает column-stats Iceberg-таблицы, чтобы
         #      планировщик StarRocks не делал это синхронно на первом запросе
         #      пользователя (это отдельный read-path к Parquet footer'ам).
-        #   3. SELECT * ... LIMIT — прогревает BE: инициализирует S3-клиент к
-        #      Garage, открывает Parquet-файлы (footer + хотя бы один row group)
-        #      и наполняет BE DataCache. count(*) для этого НЕ годится: на Iceberg
-        #      StarRocks отвечает на него из manifest'ов (record_count pushdown)
-        #      и BE даже не дёргает S3 — поэтому первый `SELECT *` всё равно
-        #      остаётся холодным и валится по 30s.
         conn = pymysql.connect(
             host=STARROCKS_FE_HOST,
             port=STARROCKS_FE_QUERY_PORT,
@@ -221,13 +215,6 @@ def microdp_data_platform_e2e():
                         # Stats — best effort: при ошибке прогрев данных всё равно
                         # сделаем, просто планировщик может оказаться чуть медленнее.
                         failed[f"analyze:{table}"] = str(exc)
-
-                    # try:
-                    #     cur.execute(f"SELECT * FROM {fqn} LIMIT 1000")
-                    #     cur.fetchall()
-                    #     warmed.append(table)
-                    # except Exception as exc:  # noqa: BLE001
-                    #     failed[f"warm:{table}"] = str(exc)
         finally:
             conn.close()
         logger.info(
